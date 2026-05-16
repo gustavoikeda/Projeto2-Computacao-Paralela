@@ -19,7 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "hash_table.c"
+#include "hash_table.h"
 
 /* Tamanho da tabela hash — primo próximo de 2^17, reduz colisões */
 #define TABLE_SIZE 131071

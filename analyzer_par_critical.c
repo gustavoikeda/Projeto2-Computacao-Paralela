@@ -1,0 +1,269 @@
+/*
+ * analyzer_par_critical.c
+ * Versão Paralela — Sincronização via #pragma omp critical
+ *
+ * Estratégia:
+ *   - Fase 1 (construção da hash): sequencial, igual ao analyzer_seq.
+ *   - Fase 2 (processamento do log): paralela com OpenMP.
+ *       * O log inteiro é carregado em memória num vetor de linhas.
+ *       * #pragma omp parallel for distribui as linhas entre as threads.
+ *       * O incremento de hit_count é protegido por #pragma omp critical,
+ *         que funciona como um lock global único — granularidade GROSSA.
+ *         Apenas uma thread por vez pode executar o bloco crítico,
+ *         independentemente de qual URL está acessando.
+ *
+ * Implicação de desempenho:
+ *   - Mesmo que duas threads acessem URLs em buckets completamente
+ *     distintos, elas se bloqueiam mutuamente.
+ *   - Alta contenção → forte serialização → speedup limitado.
+ *   - Serve como baseline de corretude para as versões mais refinadas.
+ *
+ * Compilação:
+ *   gcc -O2 -fopenmp analyzer_par_critical.c hash_table.c -o analyzer_par_critical
+ *
+ * Uso:
+ *   export OMP_NUM_THREADS=8
+ *   ./analyzer_par_critical log_distribuido.txt
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <omp.h>
+#include "hash_table.h"
+
+/* Tamanho da tabela hash — primo próximo de 2^17, reduz colisões */
+#define TABLE_SIZE 131071
+
+/* Tamanho máximo de uma linha do log */
+#define MAX_LINE 256
+
+/* Tamanho máximo de uma URL */
+#define MAX_URL 128
+
+/* Capacidade inicial do vetor de linhas (cresce dinamicamente) */
+#define INITIAL_CAPACITY 1024
+
+/* ---------------------------------------------------------------
+ * Fase 1: Construção da tabela hash a partir do manifest.txt
+ * Idêntica à versão sequencial — sempre executada em thread única.
+ * --------------------------------------------------------------- */
+static HashTable* build_table_from_manifest(const char* manifest_path) {
+    FILE* fp = fopen(manifest_path, "r");
+    if (!fp) {
+        perror("Erro ao abrir manifest.txt");
+        exit(EXIT_FAILURE);
+    }
+
+    HashTable* ht = ht_create(TABLE_SIZE);
+    if (!ht) {
+        fprintf(stderr, "Erro ao criar tabela hash\n");
+        fclose(fp);
+        exit(EXIT_FAILURE);
+    }
+
+    char url[MAX_URL];
+    while (fgets(url, sizeof(url), fp)) {
+        url[strcspn(url, "\n")] = '\0';
+        if (strlen(url) > 0) {
+            ht_put(ht, url);
+        }
+    }
+
+    fclose(fp);
+    return ht;
+}
+
+/* ---------------------------------------------------------------
+ * Extrai a URL de uma linha de log no formato Apache/Nginx:
+ *   127.0.0.1 - - [timestamp] "GET /url HTTP/1.1" 200 1500
+ * --------------------------------------------------------------- */
+static int parse_url(const char* line, char* url_out, size_t max_len) {
+    const char* quote = strchr(line, '"');
+    if (!quote) return 0;
+    quote++;
+
+    const char* space = strchr(quote, ' ');
+    if (!space) return 0;
+
+    const char* url_start = space + 1;
+    const char* url_end   = strchr(url_start, ' ');
+    if (!url_end) return 0;
+
+    size_t len = url_end - url_start;
+    if (len == 0 || len >= max_len) return 0;
+
+    strncpy(url_out, url_start, len);
+    url_out[len] = '\0';
+    return 1;
+}
+
+/* ---------------------------------------------------------------
+ * Carrega todas as linhas do log em memória.
+ *
+ * Retorna um vetor de strings alocadas individualmente.
+ * *count recebe o número de linhas válidas carregadas.
+ *
+ * Estratégia necessária para o parallel for:
+ *   fgets() não é thread-safe para leitura concorrente do mesmo FILE*.
+ *   Carregamos tudo antes e deixamos o vetor ser acessado em paralelo.
+ * --------------------------------------------------------------- */
+static char** load_log_lines(const char* log_path, long* count) {
+    FILE* fp = fopen(log_path, "r");
+    if (!fp) {
+        perror("Erro ao abrir arquivo de log");
+        exit(EXIT_FAILURE);
+    }
+
+    long capacity = INITIAL_CAPACITY;
+    char** lines  = (char**)malloc(sizeof(char*) * capacity);
+    if (!lines) {
+        perror("Erro ao alocar vetor de linhas");
+        fclose(fp);
+        exit(EXIT_FAILURE);
+    }
+
+    char buffer[MAX_LINE];
+    long n = 0;
+
+    while (fgets(buffer, sizeof(buffer), fp)) {
+        /* Cresce o vetor se necessário (duplica capacidade) */
+        if (n == capacity) {
+            capacity *= 2;
+            char** tmp = (char**)realloc(lines, sizeof(char*) * capacity);
+            if (!tmp) {
+                perror("Erro ao realocar vetor de linhas");
+                fclose(fp);
+                exit(EXIT_FAILURE);
+            }
+            lines = tmp;
+        }
+
+        /* Copia a linha para uma string própria */
+        lines[n] = (char*)malloc(strlen(buffer) + 1);
+        if (!lines[n]) {
+            perror("Erro ao alocar linha");
+            fclose(fp);
+            exit(EXIT_FAILURE);
+        }
+        strcpy(lines[n], buffer);
+        n++;
+    }
+
+    fclose(fp);
+    *count = n;
+    return lines;
+}
+
+/* ---------------------------------------------------------------
+ * Libera o vetor de linhas carregado em memória.
+ * --------------------------------------------------------------- */
+static void free_log_lines(char** lines, long count) {
+    for (long i = 0; i < count; i++) {
+        free(lines[i]);
+    }
+    free(lines);
+}
+
+/* ---------------------------------------------------------------
+ * Fase 2: Processamento paralelo do log com omp critical.
+ *
+ * Fluxo por thread:
+ *   1. Recebe um subconjunto de linhas via parallel for.
+ *   2. Extrai a URL da linha (parse é local, sem compartilhamento).
+ *   3. Busca o nó na hash — ht_get() é read-only, thread-safe.
+ *   4. Incrementa hit_count dentro de #pragma omp critical.
+ *      → Apenas UMA thread por vez executa essa seção.
+ *      → Todas as threads disputam o MESMO lock implícito.
+ * --------------------------------------------------------------- */
+static void process_log_parallel(HashTable* ht, const char* log_path) {
+    long line_count = 0;
+    char** lines = load_log_lines(log_path, &line_count);
+
+    long lines_processed = 0;
+    long lines_not_found = 0;
+
+    /*
+     * parallel for: cada thread processa um intervalo de índices.
+     * schedule(dynamic, 512): blocos de 512 linhas por vez —
+     *   compensa variação no custo de parse entre linhas.
+     * reduction: acumula contadores locais antes de somar ao global.
+     */
+    #pragma omp parallel for           \
+        schedule(dynamic, 512)         \
+        reduction(+:lines_processed)   \
+        reduction(+:lines_not_found)
+    for (long i = 0; i < line_count; i++) {
+        char url[MAX_URL];
+
+        /* Parse é local a cada thread — sem risco de corrida */
+        if (!parse_url(lines[i], url, sizeof(url))) {
+            continue;
+        }
+
+        /* ht_get() só lê a estrutura — seguro em paralelo */
+        CacheNode* node = ht_get(ht, url);
+
+        if (node) {
+            /*
+             * SEÇÃO CRÍTICA — granularidade grossa.
+             * Somente uma thread executa por vez, globalmente.
+             * Mesmo threads em buckets diferentes ficam bloqueadas.
+             */
+            #pragma omp critical
+            {
+                node->hit_count++;
+            }
+        } else {
+            lines_not_found++;
+        }
+
+        lines_processed++;
+    }
+
+    printf("Linhas processadas       : %ld\n", lines_processed);
+    if (lines_not_found > 0) {
+        printf("URLs nao encontradas na hash : %ld\n", lines_not_found);
+    }
+
+    free_log_lines(lines, line_count);
+}
+
+/* ---------------------------------------------------------------
+ * main
+ * --------------------------------------------------------------- */
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Uso: %s <arquivo_de_log>\n", argv[0]);
+        fprintf(stderr, "Exemplo: ./analyzer_par_critical log_distribuido.txt\n");
+        return EXIT_FAILURE;
+    }
+
+    const char* log_path      = argv[1];
+    const char* manifest_path = "manifest.txt";
+    const char* output_path   = "results.csv";
+
+    printf("Threads disponiveis: %d\n", omp_get_max_threads());
+
+    /* --- Fase 1: Constrói a tabela hash (sequencial) --- */
+    printf("Carregando manifest: %s\n", manifest_path);
+    HashTable* ht = build_table_from_manifest(manifest_path);
+    printf("Tabela hash criada com %d buckets\n", TABLE_SIZE);
+
+    /* --- Fase 2: Processa o log em paralelo --- */
+    printf("Processando log: %s\n", log_path);
+    double t_start = omp_get_wtime();
+    process_log_parallel(ht, log_path);
+    double t_end = omp_get_wtime();
+    printf("Tempo de processamento   : %.4f segundos\n", t_end - t_start);
+
+    /* --- Fase 3: Salva resultados --- */
+    printf("Salvando resultados em: %s\n", output_path);
+    ht_save_results(ht, output_path);
+
+    /* --- Libera memória --- */
+    ht_destroy(ht);
+
+    printf("Concluido.\n");
+    return EXIT_SUCCESS;
+}
