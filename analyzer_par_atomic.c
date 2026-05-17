@@ -1,26 +1,26 @@
 /*
- * analyzer_seq.c
- * Versão Sequencial — Analisador de Cache de CDN
+ * analyzer_par_atomic.c
+ * Versão Paralela com Atomic — Analisador de Cache de CDN
  *
  * Funcionamento:
  *   1. Lê o manifest.txt e constrói a tabela hash com hit_count = 0
- *   2. Lê o arquivo de log linha por linha
- *   3. Extrai a URL de cada linha
+ *   2. Lê o arquivo de log linha por linha e armazena em um vetor de strings
+ *   3. Paraleliza o processamento do vetor de linhas, onde cada thread extrai a URL e incrementa o contador usando #pragma omp atomic
  *   4. Localiza a URL na tabela hash e incrementa o contador
  *   5. Salva os resultados em results.csv
  *
  * Compilação:
- *   gcc -O2 analyzer_seq.c hash_table.c -o analyzer_seq
+ *   gcc -O2 analyzer_par_atomic.c hash_table.c -o analyzer_par_atomic
  *
  * Uso:
- *   ./analyzer_seq log_distribuido.txt
+ *   ./analyzer_par_atomic log_distribuido.txt 4
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "hash_table.h"
-#include <time.h>
+#include <omp.h>
 
 /* Tamanho da tabela hash — primo próximo de 2^17, reduz colisões */
 #define TABLE_SIZE 131071
@@ -99,73 +99,85 @@ int parse_url(const char* line, char* url_out, size_t max_len) {
 }
 
 /* ---------------------------------------------------------------
- * Fase 2: Processa o arquivo de log linha a linha
- * Para cada linha: extrai URL → busca na hash → incrementa contador
+ * Fase 2: Processa o arquivo de log 
+ * coloca tudo em vetor de linhas para cada linha do log estrai o url e coloca
+ * cada linha: 
  * --------------------------------------------------------------- */
 void process_log(HashTable* ht, const char* log_path) {
     FILE* fp = fopen(log_path, "r");
-    if (!fp) {
-        perror("Erro ao abrir arquivo de log");
-        exit(EXIT_FAILURE);
-    }
+    if (!fp) { perror("Erro ao abrir log"); exit(EXIT_FAILURE); }
 
-    char line[MAX_LINE];
-    char url[MAX_URL];
-    long lines_processed = 0;
+    /* --- Carrega todas as linhas em memória --- */
+    char** lines = malloc(sizeof(char*) * 10000000);
+    long total = 0;
+    char buffer[MAX_LINE];
+
+    while (fgets(buffer, sizeof(buffer), fp)) {
+        lines[total] = strdup(buffer);
+        total++;
+    }
+    fclose(fp);
+
     long lines_not_found = 0;
 
-    while (fgets(line, sizeof(line), fp)) {
-        /* Extrai a URL da linha */
-        if (!parse_url(line, url, sizeof(url))) {
-            continue; /* Linha malformada, ignora */
-        }
+    /* --- Paraleliza apenas o loop de processamento --- */
+    #pragma omp parallel for schedule(static)
+    for (long i = 0; i < total; i++) {
+        char url[MAX_URL];
 
-        /* Busca o nó na tabela hash */
+        if (!parse_url(lines[i], url, sizeof(url)))
+            continue;
+
         CacheNode* node = ht_get(ht, url);
 
         if (node) {
+            /* Só esta linha é protegida — granularidade fina */
+            #pragma omp atomic update
             node->hit_count++;
-        } else {
-            /* Não deve acontecer: todas as URLs do log estão no manifest */
-            lines_not_found++;
         }
-
-        lines_processed++;
     }
 
-    fclose(fp);
+    /* Libera memória das linhas */
+    for (long i = 0; i < total; i++) free(lines[i]);
+    free(lines);
 
-    printf("Linhas processadas : %ld\n", lines_processed);
-    if (lines_not_found > 0) {
-        printf("URLs nao encontradas na hash: %ld\n", lines_not_found);
-    }
+    printf("Linhas processadas: %ld\n", total);
 }
 
 /* ---------------------------------------------------------------
  * main
  * --------------------------------------------------------------- */
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
+    if (argc < 3) {
         fprintf(stderr, "Uso: %s <arquivo_de_log>\n", argv[0]);
         fprintf(stderr, "Exemplo: ./analyzer_seq log_distribuido.txt\n");
         return EXIT_FAILURE;
     }
 
     const char* log_path      = argv[1];
+    int         num_threads   = atoi(argv[2]);
     const char* manifest_path = "manifest.txt";
     const char* output_path   = "results.csv";
+
+    /* Define número de threads para o OpenMP */
+    omp_set_num_threads(num_threads);
+    printf("Threads: %d\n", num_threads);
 
     /* --- Fase 1: Constrói a tabela hash --- */
     printf("Carregando manifest: %s\n", manifest_path);
     HashTable* ht = build_table_from_manifest(manifest_path);
     printf("Tabela hash criada com %d buckets\n", TABLE_SIZE);
 
-    /* --- Fase 2: Processa o log --- */
+    /* --- Fase 2: Processa o log e calculo do tempo--- */
     printf("Processando log: %s\n", log_path);
-    clock_t t_start = clock();
+    double t_start = omp_get_wtime();
+
     process_log(ht, log_path);
-    clock_t t_end = clock();
-    printf("Tempo de processamento: %.4f segundos\n", (double)(t_end - t_start) / CLOCKS_PER_SEC);
+
+    double t_end = omp_get_wtime();
+
+    printf("Tempo de processamento: %.4f segundos\n", t_end - t_start);
+
 
     /* --- Fase 3: Salva resultados --- */
     printf("Salvando resultados em: %s\n", output_path);
