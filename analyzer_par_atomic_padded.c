@@ -3,28 +3,22 @@
 #include <string.h>
 #include <omp.h>
 #include "hash_table_padded.h"
-
 #define TABLE_SIZE 131071
 #define MAX_LINE   256
 #define MAX_URL    128
-
 HashTable* build_table_from_manifest(const char* manifest_path) {
     FILE* fp = fopen(manifest_path, "r");
     if (!fp) { perror("Erro ao abrir manifest.txt"); exit(EXIT_FAILURE); }
-
     HashTable* ht = ht_create(TABLE_SIZE);
     if (!ht) { fprintf(stderr, "Erro ao criar tabela hash\n"); fclose(fp); exit(EXIT_FAILURE); }
-
     char url[MAX_URL];
     while (fgets(url, sizeof(url), fp)) {
         url[strcspn(url, "\n")] = '\0';
         if (strlen(url) > 0) ht_put(ht, url);
     }
-
     fclose(fp);
     return ht;
 }
-
 int parse_url(const char* line, char* url_out, size_t max_len) {
     const char* quote = strchr(line, '"');
     if (!quote) return 0;
@@ -40,72 +34,50 @@ int parse_url(const char* line, char* url_out, size_t max_len) {
     url_out[len] = '\0';
     return 1;
 }
-
-void process_log(HashTable* ht, const char* log_path, int num_threads) {
+void process_log(HashTable* ht, const char* log_path) {
     FILE* fp = fopen(log_path, "r");
     if (!fp) { perror("Erro ao abrir log"); exit(EXIT_FAILURE); }
-
-    /* Carrega todas as linhas em memória */
     size_t capacity = 10000000;
     char** lines = malloc(sizeof(char*) * capacity);
     if (!lines) { perror("Erro ao alocar vetor de linhas"); exit(EXIT_FAILURE); }
-
     long total = 0;
     char buffer[MAX_LINE];
-
     while (fgets(buffer, sizeof(buffer), fp)) {
         lines[total++] = strdup(buffer);
         if ((size_t)total >= capacity) break;
     }
     fclose(fp);
-
-    omp_set_num_threads(num_threads);
-
-    /* Paraleliza o processamento — protege apenas o incremento */
     #pragma omp parallel for schedule(static)
     for (long i = 0; i < total; i++) {
         char url[MAX_URL];
         if (!parse_url(lines[i], url, sizeof(url))) continue;
-
         CacheNode* node = ht_get(ht, url);
         if (node) {
             #pragma omp atomic update
             node->hit_count++;
         }
     }
-
     for (long i = 0; i < total; i++) free(lines[i]);
     free(lines);
-
     printf("Linhas processadas: %ld\n", total);
 }
-
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, "Uso: %s <arquivo_de_log> <num_threads>\n", argv[0]);
-        fprintf(stderr, "Exemplo: ./analyzer_par_atomic log_distribuido.txt 8\n");
+    if (argc < 2) {
+        fprintf(stderr, "Uso: %s <arquivo_de_log>\n", argv[0]);
+        fprintf(stderr, "Exemplo: ./analyzer_par_atomic log_distribuido.txt\n");
         return EXIT_FAILURE;
     }
-
     const char* log_path      = argv[1];
-    int         num_threads   = atoi(argv[2]);
     const char* manifest_path = "manifest.txt";
     const char* output_path   = "results.csv";
-
-    if (num_threads < 1) { fprintf(stderr, "num_threads deve ser >= 1\n"); return EXIT_FAILURE; }
-
-    printf("Threads: %d\n", num_threads);
-
+    printf("Threads: %d\n", omp_get_max_threads());
     printf("Carregando manifest: %s\n", manifest_path);
     HashTable* ht = build_table_from_manifest(manifest_path);
     printf("Tabela hash criada com %d buckets\n", TABLE_SIZE);
-
     printf("Processando log: %s\n", log_path);
-    process_log(ht, log_path, num_threads);
-
+    process_log(ht, log_path);
     printf("Salvando resultados em: %s\n", output_path);
     ht_save_results(ht, output_path);
-
     ht_destroy(ht);
     printf("Concluido.\n");
     return EXIT_SUCCESS;

@@ -1,40 +1,22 @@
-/*
- * analyzer_seq.c
- * Versão Sequencial — Analisador de Cache de CDN
- *
- * Funcionamento:
- *   1. Lê o manifest.txt e constrói a tabela hash com hit_count = 0
- *   2. Lê o arquivo de log linha por linha
- *   3. Extrai a URL de cada linha
- *   4. Localiza a URL na tabela hash e incrementa o contador
- *   5. Salva os resultados em results.csv
- *
- * Compilação:
- *   gcc -O2 analyzer_seq.c hash_table.c -o analyzer_seq
- *
- * Uso:
- *   ./analyzer_seq log_distribuido.txt
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <omp.h>
 #include "hash_table.h"
-#include <time.h>
 
-/* Tamanho da tabela hash — primo próximo de 2^17, reduz colisões */
 #define TABLE_SIZE 131071
-
-/* Tamanho máximo de uma linha do log (~256 bytes é suficiente) */
 #define MAX_LINE 256
+#define MAX_URL  128
 
-/* Tamanho máximo de uma URL */
-#define MAX_URL 128
+static size_t hash_djb2(const char* str, size_t size) {
+    unsigned long hash = 5381;
+    int c;
+    while ((c = *str++)) {
+        hash = ((hash << 5) + hash) + c;
+    }
+    return hash % size;
+}
 
-/* ---------------------------------------------------------------
- * Fase 1: Construção da tabela hash a partir do manifest.txt
- * Cada URL é inserida com hit_count = 0
- * --------------------------------------------------------------- */
 HashTable* build_table_from_manifest(const char* manifest_path) {
     FILE* fp = fopen(manifest_path, "r");
     if (!fp) {
@@ -50,11 +32,8 @@ HashTable* build_table_from_manifest(const char* manifest_path) {
     }
 
     char url[MAX_URL];
-    /* Cada linha do manifest é uma URL — lemos e inserimos */
     while (fgets(url, sizeof(url), fp)) {
-        /* Remove o '\n' do final, se existir */
         url[strcspn(url, "\n")] = '\0';
-
         if (strlen(url) > 0) {
             ht_put(ht, url);
         }
@@ -64,30 +43,17 @@ HashTable* build_table_from_manifest(const char* manifest_path) {
     return ht;
 }
 
-/* ---------------------------------------------------------------
- * Extrai a URL de uma linha de log no formato Apache/Nginx:
- *   127.0.0.1 - - [timestamp] "GET /url HTTP/1.1" 200 1500
- *
- * Estratégia: procura a primeira aspa ", avança "GET " (ou outro
- * método), e copia até o próximo espaço.
- * --------------------------------------------------------------- */
 int parse_url(const char* line, char* url_out, size_t max_len) {
-    /* Acha a primeira aspa dupla */
     const char* quote = strchr(line, '"');
     if (!quote) return 0;
 
-    /* Avança para depois da aspa */
     quote++;
 
-    /* Pula o método HTTP (GET, POST, etc.) até o espaço */
     const char* space = strchr(quote, ' ');
     if (!space) return 0;
 
-    /* URL começa logo após o espaço */
     const char* url_start = space + 1;
-
-    /* URL termina no próximo espaço */
-    const char* url_end = strchr(url_start, ' ');
+    const char* url_end   = strchr(url_start, ' ');
     if (!url_end) return 0;
 
     size_t len = url_end - url_start;
@@ -98,56 +64,107 @@ int parse_url(const char* line, char* url_out, size_t max_len) {
     return 1;
 }
 
-/* ---------------------------------------------------------------
- * Fase 2: Processa o arquivo de log linha a linha
- * Para cada linha: extrai URL → busca na hash → incrementa contador
- * --------------------------------------------------------------- */
-void process_log(HashTable* ht, const char* log_path) {
+char** load_lines(const char* log_path, long* count) {
     FILE* fp = fopen(log_path, "r");
     if (!fp) {
         perror("Erro ao abrir arquivo de log");
         exit(EXIT_FAILURE);
     }
 
-    char line[MAX_LINE];
-    char url[MAX_URL];
-    long lines_processed = 0;
-    long lines_not_found = 0;
+    long total = 0;
+    char tmp[MAX_LINE];
+    while (fgets(tmp, sizeof(tmp), fp)) {
+        total++;
+    }
 
-    while (fgets(line, sizeof(line), fp)) {
-        /* Extrai a URL da linha */
-        if (!parse_url(line, url, sizeof(url))) {
-            continue; /* Linha malformada, ignora */
+    char** lines = (char**)malloc(sizeof(char*) * total);
+    if (!lines) {
+        perror("Erro ao alocar vetor de linhas");
+        fclose(fp);
+        exit(EXIT_FAILURE);
+    }
+
+    rewind(fp);
+    long i = 0;
+    while (i < total && fgets(tmp, sizeof(tmp), fp)) {
+        lines[i] = (char*)malloc(strlen(tmp) + 1);
+        if (!lines[i]) {
+            perror("Erro ao alocar linha");
+            fclose(fp);
+            exit(EXIT_FAILURE);
         }
-
-        /* Busca o nó na tabela hash */
-        CacheNode* node = ht_get(ht, url);
-
-        if (node) {
-            node->hit_count++;
-        } else {
-            /* Não deve acontecer: todas as URLs do log estão no manifest */
-            lines_not_found++;
-        }
-
-        lines_processed++;
+        strcpy(lines[i], tmp);
+        i++;
     }
 
     fclose(fp);
+    *count = total;
+    return lines;
+}
 
-    printf("Linhas processadas : %ld\n", lines_processed);
+void free_lines(char** lines, long count) {
+    for (long i = 0; i < count; i++) {
+        free(lines[i]);
+    }
+    free(lines);
+}
+
+omp_lock_t* create_locks(size_t count) {
+    omp_lock_t* locks = (omp_lock_t*)malloc(sizeof(omp_lock_t) * count);
+    if (!locks) {
+        perror("Erro ao alocar locks");
+        exit(EXIT_FAILURE);
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        omp_init_lock(&locks[i]);
+    }
+
+    return locks;
+}
+
+void destroy_locks(omp_lock_t* locks, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        omp_destroy_lock(&locks[i]);
+    }
+    free(locks);
+}
+
+void process_log_parallel(HashTable* ht, char** lines, long count,
+                           omp_lock_t* locks) {
+    long lines_not_found = 0;
+
+    #pragma omp parallel for schedule(dynamic, 1024) reduction(+:lines_not_found)
+    for (long i = 0; i < count; i++) {
+        char url[MAX_URL];
+
+        if (!parse_url(lines[i], url, sizeof(url))) {
+            continue;
+        }
+
+        size_t bucket = hash_djb2(url, TABLE_SIZE);
+
+        omp_set_lock(&locks[bucket]);
+
+        CacheNode* node = ht_get(ht, url);
+        if (node) {
+            node->hit_count++;
+        } else {
+            lines_not_found++;
+        }
+
+        omp_unset_lock(&locks[bucket]);
+    }
+
     if (lines_not_found > 0) {
         printf("URLs nao encontradas na hash: %ld\n", lines_not_found);
     }
 }
 
-/* ---------------------------------------------------------------
- * main
- * --------------------------------------------------------------- */
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Uso: %s <arquivo_de_log>\n", argv[0]);
-        fprintf(stderr, "Exemplo: ./analyzer_seq log_distribuido.txt\n");
+        fprintf(stderr, "Exemplo: ./analyzer_par_lock log_distribuido.txt\n");
         return EXIT_FAILURE;
     }
 
@@ -155,23 +172,33 @@ int main(int argc, char* argv[]) {
     const char* manifest_path = "manifest.txt";
     const char* output_path   = "results.csv";
 
-    /* --- Fase 1: Constrói a tabela hash --- */
+    printf("Threads em uso: %d\n", omp_get_max_threads());
+
     printf("Carregando manifest: %s\n", manifest_path);
     HashTable* ht = build_table_from_manifest(manifest_path);
     printf("Tabela hash criada com %d buckets\n", TABLE_SIZE);
 
-    /* --- Fase 2: Processa o log --- */
-    printf("Processando log: %s\n", log_path);
-    clock_t t_start = clock();
-    process_log(ht, log_path);
-    clock_t t_end = clock();
-    printf("Tempo de processamento: %.4f segundos\n", (double)(t_end - t_start) / CLOCKS_PER_SEC);
+    printf("Inicializando %d locks...\n", TABLE_SIZE);
+    omp_lock_t* locks = create_locks(TABLE_SIZE);
 
-    /* --- Fase 3: Salva resultados --- */
+    printf("Carregando log em memoria: %s\n", log_path);
+    long count = 0;
+    char** lines = load_lines(log_path, &count);
+    printf("Linhas carregadas: %ld\n", count);
+
+    printf("Processando com bucket lock...\n");
+    double t_start = omp_get_wtime();
+
+    process_log_parallel(ht, lines, count, locks);
+
+    double t_end = omp_get_wtime();
+    printf("Tempo de processamento: %.4f segundos\n", t_end - t_start);
+
     printf("Salvando resultados em: %s\n", output_path);
     ht_save_results(ht, output_path);
 
-    /* --- Libera memória --- */
+    destroy_locks(locks, TABLE_SIZE);
+    free_lines(lines, count);
     ht_destroy(ht);
 
     printf("Concluido.\n");
