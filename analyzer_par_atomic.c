@@ -107,4 +107,11 @@ int main(int argc, char* argv[]) {
     double t_end = omp_get_wtime();
     printf("Tempo de processamento: %.4f segundos\n", t_end - t_start);
 
-    printf("Salvando resultados em: %s\n", output_
+    printf("Salvando resultados em: %s\n", output_path);
+    ht_save_results(ht, output_path);
+
+    ht_destroy(ht);
+
+    printf("Concluido.\n");
+    return EXIT_SUCCESS;
+}
